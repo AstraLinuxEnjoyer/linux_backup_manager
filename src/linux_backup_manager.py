@@ -9,6 +9,7 @@ import queue
 import shutil
 import subprocess
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -25,6 +26,16 @@ DEFAULT_EXCLUDES = [
     "/media",
     "/lost+found",
 ]
+
+
+def format_bytes(size: int) -> str:
+    units = ("Б", "КБ", "МБ", "ГБ", "ТБ")
+    value = float(size)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} ТБ"
 
 
 class CommandRunner:
@@ -89,6 +100,8 @@ class BackupManagerApp(tk.Tk):
         self.restore_target_var = tk.StringVar(value="/")
         self.compression_var = tk.StringVar(value="lzma,9")
         self.status_var = tk.StringVar(value="Готово")
+        self.elapsed_var = tk.StringVar(value="")
+        self.operation_started_at: float | None = None
 
         self._build_ui()
         self._refresh_dependency_state()
@@ -190,8 +203,13 @@ class BackupManagerApp(tk.Tk):
 
         status = ttk.Frame(root)
         status.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        status.columnconfigure(0, weight=1)
+        status.columnconfigure(0, weight=0)
+        status.columnconfigure(1, weight=1)
+        status.columnconfigure(2, weight=0)
         ttk.Label(status, textvariable=self.status_var).grid(row=0, column=0, sticky="w")
+        self.progress = ttk.Progressbar(status, mode="indeterminate")
+        self.progress.grid(row=0, column=1, sticky="ew", padx=12)
+        ttk.Label(status, textvariable=self.elapsed_var).grid(row=0, column=2, sticky="e")
 
     def _refresh_dependency_state(self) -> None:
         borg = shutil.which("borg")
@@ -222,6 +240,26 @@ class BackupManagerApp(tk.Tk):
         self.after(100, self.flush_log)
 
     def command_finished(self, code: int) -> None:
+        self.after(0, self.finish_operation, code)
+
+    def start_operation(self, label: str = "Выполняется...") -> None:
+        self.operation_started_at = time.monotonic()
+        self.status_var.set(label)
+        self.elapsed_var.set("00:00")
+        self.progress.start(12)
+        self.after(1000, self.update_elapsed)
+
+    def update_elapsed(self) -> None:
+        if self.operation_started_at is None:
+            return
+        elapsed = int(time.monotonic() - self.operation_started_at)
+        minutes, seconds = divmod(elapsed, 60)
+        self.elapsed_var.set(f"{minutes:02d}:{seconds:02d}")
+        self.after(1000, self.update_elapsed)
+
+    def finish_operation(self, code: int) -> None:
+        self.operation_started_at = None
+        self.progress.stop()
         if code == 0:
             self.enqueue_log("Готово.")
             self.status_var.set("Готово")
@@ -242,7 +280,7 @@ class BackupManagerApp(tk.Tk):
             return
 
         command = ["borg", *args]
-        self.status_var.set("Выполняется...")
+        self.start_operation()
 
         def worker() -> None:
             code = -1
@@ -276,7 +314,7 @@ class BackupManagerApp(tk.Tk):
         if self.runner.running():
             messagebox.showinfo(APP_NAME, "Дождитесь завершения текущей операции.")
             return
-        self.status_var.set("Выполняется...")
+        self.start_operation()
 
         def worker() -> None:
             final_code = 0
@@ -357,6 +395,7 @@ class BackupManagerApp(tk.Tk):
             "create",
             "--verbose",
             "--stats",
+            "--progress",
             "--show-rc",
             "--numeric-owner",
             "--compression",
@@ -382,11 +421,43 @@ class BackupManagerApp(tk.Tk):
             return
 
         Path(repo).mkdir(parents=True, exist_ok=True)
+        if not self.confirm_storage_capacity(repo, sources):
+            return
         commands = []
         if not self.repo_is_initialized(repo):
             commands.append(self.borg_init_command(repo))
         commands.append(self.build_create_args(repo, sources, archive_prefix))
         self.run_borg_sequence(commands)
+
+    def confirm_storage_capacity(self, repo: str, sources: list[str]) -> bool:
+        try:
+            repo_usage = shutil.disk_usage(repo)
+        except OSError as exc:
+            messagebox.showerror(APP_NAME, f"Не удалось проверить свободное место: {exc}")
+            return False
+
+        if repo_usage.free < 1024**3:
+            return messagebox.askyesno(
+                APP_NAME,
+                "В хранилище меньше 1 ГБ свободного места.\n\n"
+                "Резервная копия почти наверняка не поместится. Всё равно продолжить?",
+            )
+
+        if sources == ["/"]:
+            try:
+                root_usage = shutil.disk_usage("/")
+            except OSError:
+                return True
+            used = root_usage.used
+            if repo_usage.free < used:
+                return messagebox.askyesno(
+                    APP_NAME,
+                    "Свободного места меньше, чем занято в системе до сжатия.\n\n"
+                    f"Занято в системе: {format_bytes(used)}\n"
+                    f"Свободно в хранилище: {format_bytes(repo_usage.free)}\n\n"
+                    "Сжатие и дедупликация могут уменьшить архив, но места может не хватить. Продолжить?",
+                )
+        return True
 
     def create_system_backup(self) -> None:
         confirm = messagebox.askyesno(
@@ -435,7 +506,7 @@ class BackupManagerApp(tk.Tk):
         if not repo:
             messagebox.showwarning(APP_NAME, "Выберите хранилище копий.")
             return
-        self.run_borg(["check", "--verify-data", repo])
+        self.run_borg(["check", "--verify-data", "--progress", repo])
 
     def restore_archive(self) -> None:
         repo = self.repo_var.get().strip()
@@ -458,7 +529,7 @@ class BackupManagerApp(tk.Tk):
             return
 
         Path(target).mkdir(parents=True, exist_ok=True)
-        self.run_borg(["extract", "--verbose", "--numeric-owner", f"{repo}::{archive}"], cwd=target)
+        self.run_borg(["extract", "--verbose", "--progress", "--numeric-owner", f"{repo}::{archive}"], cwd=target)
 
     def stop_command(self) -> None:
         self.runner.stop()
