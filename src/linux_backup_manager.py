@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import datetime as _dt
+import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -16,6 +18,19 @@ from tkinter import filedialog, messagebox, ttk
 
 
 APP_NAME = "Linux Backup Manager"
+COMPRESSION_PRESETS = {
+    "Максимальное сжатие (очень медленно)": "lzma,9",
+    "Сильное сжатие (быстрее)": "zstd,22",
+    "Баланс скорости и размера": "zstd,15",
+    "Быстрое сжатие": "zlib,9",
+    "Без сжатия": "none",
+}
+BORG_PROGRESS_RE = re.compile(
+    r"^\s*(?P<original>\S+\s+\S+)\s+O\s+"
+    r"(?P<compressed>\S+\s+\S+)\s+C\s+"
+    r"(?P<deduplicated>\S+\s+\S+)\s+D\s+"
+    r"(?P<files>\d+)\s+N\s+(?P<path>.*)$"
+)
 DEFAULT_EXCLUDES = [
     "/proc",
     "/sys",
@@ -98,7 +113,7 @@ class BackupManagerApp(tk.Tk):
         self.passphrase_var = tk.StringVar()
         self.archive_var = tk.StringVar()
         self.restore_target_var = tk.StringVar(value="/")
-        self.compression_var = tk.StringVar(value="lzma,9")
+        self.compression_var = tk.StringVar(value="Максимальное сжатие (очень медленно)")
         self.status_var = tk.StringVar(value="Готово")
         self.elapsed_var = tk.StringVar(value="")
         self.operation_started_at: float | None = None
@@ -133,9 +148,9 @@ class BackupManagerApp(tk.Tk):
         compression = ttk.Combobox(
             settings,
             textvariable=self.compression_var,
-            values=("lzma,9", "zstd,22", "zstd,15", "zlib,9", "none"),
+            values=tuple(COMPRESSION_PRESETS.keys()),
             state="readonly",
-            width=18,
+            width=34,
         )
         compression.grid(row=2, column=1, sticky="w", pady=4)
         ttk.Button(settings, text="Обновить список архивов", command=self.list_archives).grid(
@@ -185,13 +200,35 @@ class BackupManagerApp(tk.Tk):
         right = ttk.Frame(root)
         right.grid(row=1, column=1, sticky="nsew", pady=(10, 0))
         right.columnconfigure(0, weight=1)
-        right.rowconfigure(1, weight=1)
+        right.rowconfigure(2, weight=1)
 
         self.deps_label = ttk.Label(right, text="")
         self.deps_label.grid(row=0, column=0, sticky="ew")
 
+        archives_box = ttk.LabelFrame(right, text="Менеджер архивов", padding=10)
+        archives_box.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        archives_box.columnconfigure(0, weight=1)
+
+        columns = ("name", "time", "original", "compressed", "deduplicated")
+        self.archives_tree = ttk.Treeview(archives_box, columns=columns, show="headings", height=7)
+        self.archives_tree.heading("name", text="Архив")
+        self.archives_tree.heading("time", text="Создан")
+        self.archives_tree.heading("original", text="Исходно")
+        self.archives_tree.heading("compressed", text="Сжато")
+        self.archives_tree.heading("deduplicated", text="В хранилище")
+        self.archives_tree.column("name", width=210)
+        self.archives_tree.column("time", width=150)
+        self.archives_tree.column("original", width=90, anchor="e")
+        self.archives_tree.column("compressed", width=90, anchor="e")
+        self.archives_tree.column("deduplicated", width=90, anchor="e")
+        self.archives_tree.grid(row=0, column=0, columnspan=3, sticky="ew")
+        self.archives_tree.bind("<<TreeviewSelect>>", self.on_archive_selected)
+        ttk.Button(archives_box, text="Информация", command=self.show_archive_info).grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(archives_box, text="Удалить архив", command=self.delete_archive).grid(row=1, column=1, sticky="ew", padx=8, pady=(8, 0))
+        ttk.Button(archives_box, text="Обновить", command=self.list_archives).grid(row=1, column=2, sticky="ew", pady=(8, 0))
+
         log_box = ttk.LabelFrame(right, text="Журнал", padding=10)
-        log_box.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+        log_box.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
         log_box.columnconfigure(0, weight=1)
         log_box.rowconfigure(0, weight=1)
 
@@ -233,11 +270,22 @@ class BackupManagerApp(tk.Tk):
     def flush_log(self) -> None:
         while not self.log_queue.empty():
             line = self.log_queue.get_nowait()
+            self.update_borg_progress(line)
             self.log.configure(state="normal")
             self.log.insert("end", line + "\n")
             self.log.see("end")
             self.log.configure(state="disabled")
         self.after(100, self.flush_log)
+
+    def update_borg_progress(self, line: str) -> None:
+        match = BORG_PROGRESS_RE.match(line)
+        if not match:
+            return
+        self.status_var.set(
+            "Файлов: {files} | исходно: {original} | сжато: {compressed} | в архив: {deduplicated}".format(
+                **match.groupdict()
+            )
+        )
 
     def command_finished(self, code: int) -> None:
         self.after(0, self.finish_operation, code)
@@ -266,6 +314,27 @@ class BackupManagerApp(tk.Tk):
         else:
             self.enqueue_log(f"Команда завершилась с кодом {code}.")
             self.status_var.set("Ошибка выполнения")
+
+    def rollback_failed_create(self, command: list[str]) -> None:
+        if len(command) < 3 or command[0:2] != ["borg", "create"]:
+            return
+        archive_ref = next((arg for arg in command if "::" in arg and not arg.startswith("--")), "")
+        if not archive_ref:
+            return
+        repo = archive_ref.split("::", 1)[0]
+        self.enqueue_log(f"Rollback: удаляю неполный архив {archive_ref}")
+        delete_cmd = ["borg", "delete", "--force", archive_ref]
+        compact_cmd = ["borg", "compact", repo]
+        for cleanup_cmd in (delete_cmd, compact_cmd):
+            self.enqueue_log("$ " + " ".join(cleanup_cmd))
+            subprocess.run(
+                cleanup_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=self.borg_env(),
+                check=False,
+            )
 
     def run_borg(self, args: list[str], cwd: str | None = None) -> None:
         if not shutil.which("borg"):
@@ -338,6 +407,8 @@ class BackupManagerApp(tk.Tk):
                 except Exception as exc:  # noqa: BLE001 - visible GUI error.
                     self.enqueue_log(f"Ошибка: {exc}")
                 if code != 0:
+                    if code >= 2:
+                        self.rollback_failed_create(command)
                     final_code = code
                     break
             self.command_finished(final_code)
@@ -399,7 +470,7 @@ class BackupManagerApp(tk.Tk):
             "--show-rc",
             "--numeric-owner",
             "--compression",
-            self.compression_var.get(),
+            COMPRESSION_PRESETS.get(self.compression_var.get(), "lzma,9"),
         ]
         excludes = [*DEFAULT_EXCLUDES]
         repo_path = str(Path(repo).resolve())
@@ -437,11 +508,12 @@ class BackupManagerApp(tk.Tk):
             return False
 
         if repo_usage.free < 1024**3:
-            return messagebox.askyesno(
+            messagebox.showerror(
                 APP_NAME,
                 "В хранилище меньше 1 ГБ свободного места.\n\n"
-                "Резервная копия почти наверняка не поместится. Всё равно продолжить?",
+                "Резервная копия почти наверняка не поместится. Операция отменена.",
             )
+            return False
 
         if sources == ["/"]:
             try:
@@ -483,7 +555,7 @@ class BackupManagerApp(tk.Tk):
 
         try:
             result = subprocess.run(
-                ["borg", "list", "--short", repo],
+                ["borg", "list", "--json", repo],
                 check=True,
                 text=True,
                 stdout=subprocess.PIPE,
@@ -495,11 +567,101 @@ class BackupManagerApp(tk.Tk):
             messagebox.showerror(APP_NAME, "Не удалось получить список архивов. Подробности в журнале.")
             return
 
-        archives = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        data = json.loads(result.stdout)
+        archives = [item["name"] for item in data.get("archives", [])]
         self.archive_combo.configure(values=archives)
+        self.archives_tree.delete(*self.archives_tree.get_children())
+        for item in data.get("archives", []):
+            info = self.get_archive_info(repo, item["name"])
+            self.archives_tree.insert(
+                "",
+                "end",
+                values=(
+                    item["name"],
+                    item.get("time", "")[:19].replace("T", " "),
+                    info.get("original", ""),
+                    info.get("compressed", ""),
+                    info.get("deduplicated", ""),
+                ),
+            )
         if archives:
             self.archive_var.set(archives[-1])
         self.enqueue_log(f"Найдено архивов: {len(archives)}")
+
+    def get_archive_info(self, repo: str, archive: str) -> dict[str, str]:
+        try:
+            result = subprocess.run(
+                ["borg", "info", "--json", f"{repo}::{archive}"],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=self.borg_env(),
+            )
+            data = json.loads(result.stdout)
+        except Exception as exc:  # noqa: BLE001 - visible GUI error.
+            self.enqueue_log(f"Не удалось прочитать информацию об архиве {archive}: {exc}")
+            return {}
+
+        stats = data.get("archives", [{}])[0].get("stats", {})
+        return {
+            "original": format_bytes(int(stats.get("original_size", 0))),
+            "compressed": format_bytes(int(stats.get("compressed_size", 0))),
+            "deduplicated": format_bytes(int(stats.get("deduplicated_size", 0))),
+        }
+
+    def on_archive_selected(self, _event=None) -> None:
+        selected = self.archives_tree.selection()
+        if not selected:
+            return
+        values = self.archives_tree.item(selected[0], "values")
+        if values:
+            self.archive_var.set(values[0])
+
+    def selected_archive(self) -> str:
+        selected = self.archives_tree.selection()
+        if selected:
+            values = self.archives_tree.item(selected[0], "values")
+            if values:
+                return str(values[0])
+        return self.archive_var.get().strip()
+
+    def show_archive_info(self) -> None:
+        repo = self.repo_var.get().strip()
+        archive = self.selected_archive()
+        if not repo or not archive:
+            messagebox.showwarning(APP_NAME, "Выберите хранилище и архив.")
+            return
+        try:
+            result = subprocess.run(
+                ["borg", "info", f"{repo}::{archive}"],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=self.borg_env(),
+            )
+        except subprocess.CalledProcessError as exc:
+            self.enqueue_log(exc.stdout)
+            messagebox.showerror(APP_NAME, "Не удалось получить информацию об архиве.")
+            return
+        self.enqueue_log(result.stdout.strip())
+        messagebox.showinfo(APP_NAME, f"Информация об архиве выведена в журнал:\n{archive}")
+
+    def delete_archive(self) -> None:
+        repo = self.repo_var.get().strip()
+        archive = self.selected_archive()
+        if not repo or not archive:
+            messagebox.showwarning(APP_NAME, "Выберите хранилище и архив.")
+            return
+        if not messagebox.askyesno(APP_NAME, f"Удалить архив?\n\n{archive}"):
+            return
+        self.run_borg_sequence(
+            [
+                ["borg", "delete", "--force", f"{repo}::{archive}"],
+                ["borg", "compact", repo],
+            ]
+        )
 
     def check_repo(self) -> None:
         repo = self.repo_var.get().strip()
@@ -510,7 +672,7 @@ class BackupManagerApp(tk.Tk):
 
     def restore_archive(self) -> None:
         repo = self.repo_var.get().strip()
-        archive = self.archive_var.get().strip()
+        archive = self.selected_archive()
         target = self.restore_target_var.get().strip()
         if not repo or not archive or not target:
             messagebox.showwarning(APP_NAME, "Укажите репозиторий, архив и каталог восстановления.")
