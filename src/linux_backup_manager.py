@@ -108,13 +108,13 @@ class BackupManagerApp(tk.Tk):
         settings.grid(row=0, column=0, columnspan=2, sticky="ew")
         settings.columnconfigure(1, weight=1)
 
-        ttk.Label(settings, text="Репозиторий Borg").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Label(settings, text="Хранилище копий").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Entry(settings, textvariable=self.repo_var).grid(row=0, column=1, sticky="ew", pady=4)
         ttk.Button(settings, text="Выбрать", command=self.choose_repo).grid(row=0, column=2, padx=(8, 0), pady=4)
 
         ttk.Label(settings, text="Пароль").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Entry(settings, textvariable=self.passphrase_var, show="*").grid(row=1, column=1, sticky="ew", pady=4)
-        ttk.Button(settings, text="Создать репозиторий", command=self.init_repo).grid(row=1, column=2, padx=(8, 0), pady=4)
+        ttk.Button(settings, text="Подготовить хранилище", command=self.init_repo).grid(row=1, column=2, padx=(8, 0), pady=4)
 
         ttk.Label(settings, text="Сжатие").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
         compression = ttk.Combobox(
@@ -133,7 +133,7 @@ class BackupManagerApp(tk.Tk):
         left.grid(row=1, column=0, sticky="nsw", pady=(10, 0), padx=(0, 10))
         left.rowconfigure(0, weight=1)
 
-        sources_box = ttk.LabelFrame(left, text="Каталоги для копии", padding=10)
+        sources_box = ttk.LabelFrame(left, text="Дополнительные каталоги", padding=10)
         sources_box.grid(row=0, column=0, sticky="nsew")
         sources_box.rowconfigure(0, weight=1)
         sources_box.columnconfigure(0, weight=1)
@@ -144,14 +144,14 @@ class BackupManagerApp(tk.Tk):
         ttk.Button(sources_box, text="Удалить", command=self.remove_source).grid(row=1, column=1, sticky="ew", padx=6, pady=(8, 0))
         ttk.Button(sources_box, text="Добавить /", command=self.add_root_source).grid(row=1, column=2, sticky="ew", pady=(8, 0))
 
-        actions = ttk.LabelFrame(left, text="Действия", padding=10)
+        actions = ttk.LabelFrame(left, text="Основные действия", padding=10)
         actions.grid(row=1, column=0, sticky="ew", pady=(10, 0))
         actions.columnconfigure(0, weight=1)
         actions.columnconfigure(1, weight=1)
 
-        ttk.Button(actions, text="Создать копию", command=self.create_backup).grid(row=0, column=0, sticky="ew", pady=3)
+        ttk.Button(actions, text="Полная копия системы", command=self.create_system_backup).grid(row=0, column=0, sticky="ew", pady=3)
         ttk.Button(actions, text="Проверить целостность", command=self.check_repo).grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=3)
-        ttk.Button(actions, text="Восстановить", command=self.restore_archive).grid(row=1, column=0, sticky="ew", pady=3)
+        ttk.Button(actions, text="Копия выбранных каталогов", command=self.create_backup).grid(row=1, column=0, sticky="ew", pady=3)
         ttk.Button(actions, text="Остановить", command=self.stop_command).grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=3)
 
         restore_box = ttk.LabelFrame(left, text="Восстановление", padding=10)
@@ -165,6 +165,9 @@ class BackupManagerApp(tk.Tk):
         ttk.Label(restore_box, text="Куда").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Entry(restore_box, textvariable=self.restore_target_var).grid(row=1, column=1, sticky="ew", pady=4)
         ttk.Button(restore_box, text="Выбрать", command=self.choose_restore_target).grid(row=1, column=2, padx=(8, 0), pady=4)
+        ttk.Button(restore_box, text="Восстановить выбранную копию", command=self.restore_archive).grid(
+            row=2, column=0, columnspan=3, sticky="ew", pady=(8, 0)
+        )
 
         right = ttk.Frame(root)
         right.grid(row=1, column=1, sticky="nsew", pady=(10, 0))
@@ -266,6 +269,44 @@ class BackupManagerApp(tk.Tk):
         self.runner._thread = threading.Thread(target=worker, daemon=True)
         self.runner._thread.start()
 
+    def run_borg_sequence(self, commands: list[list[str]], cwd: str | None = None) -> None:
+        if not shutil.which("borg"):
+            messagebox.showerror(APP_NAME, "borgbackup не установлен. Выполните: sudo apt install borgbackup")
+            return
+        if self.runner.running():
+            messagebox.showinfo(APP_NAME, "Дождитесь завершения текущей операции.")
+            return
+        self.status_var.set("Выполняется...")
+
+        def worker() -> None:
+            final_code = 0
+            for command in commands:
+                code = -1
+                try:
+                    self.enqueue_log("$ " + " ".join(command))
+                    self.runner.process = subprocess.Popen(
+                        command,
+                        cwd=cwd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        bufsize=1,
+                        env=self.borg_env(),
+                    )
+                    assert self.runner.process.stdout is not None
+                    for line in self.runner.process.stdout:
+                        self.enqueue_log(line.rstrip())
+                    code = self.runner.process.wait()
+                except Exception as exc:  # noqa: BLE001 - visible GUI error.
+                    self.enqueue_log(f"Ошибка: {exc}")
+                if code != 0:
+                    final_code = code
+                    break
+            self.command_finished(final_code)
+
+        self.runner._thread = threading.Thread(target=worker, daemon=True)
+        self.runner._thread.start()
+
     def choose_repo(self) -> None:
         path = filedialog.askdirectory(title="Выберите или создайте каталог репозитория")
         if path:
@@ -296,44 +337,74 @@ class BackupManagerApp(tk.Tk):
     def init_repo(self) -> None:
         repo = self.repo_var.get().strip()
         if not repo:
-            messagebox.showwarning(APP_NAME, "Выберите каталог репозитория.")
+            messagebox.showwarning(APP_NAME, "Выберите хранилище копий.")
             return
         Path(repo).mkdir(parents=True, exist_ok=True)
         encryption = "repokey-blake2" if self.passphrase_var.get() else "none"
         self.run_borg(["init", "--encryption", encryption, repo])
 
-    def create_backup(self) -> None:
-        repo = self.repo_var.get().strip()
-        if not repo:
-            messagebox.showwarning(APP_NAME, "Выберите репозиторий Borg.")
-            return
-        if not self.sources:
-            messagebox.showwarning(APP_NAME, "Добавьте хотя бы один каталог.")
-            return
+    def borg_init_command(self, repo: str) -> list[str]:
+        encryption = "repokey-blake2" if self.passphrase_var.get() else "none"
+        return ["borg", "init", "--encryption", encryption, repo]
 
-        archive_name = "backup-" + _dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    def repo_is_initialized(self, repo: str) -> bool:
+        return Path(repo, "config").exists()
+
+    def build_create_args(self, repo: str, sources: list[str], archive_prefix: str) -> list[str]:
+        archive_name = archive_prefix + _dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         args = [
+            "borg",
             "create",
             "--verbose",
             "--stats",
             "--show-rc",
+            "--numeric-owner",
             "--compression",
             self.compression_var.get(),
         ]
         excludes = [*DEFAULT_EXCLUDES]
         repo_path = str(Path(repo).resolve())
-        if any(source == "/" or repo_path.startswith(str(Path(source).resolve())) for source in self.sources):
+        if any(source == "/" or repo_path.startswith(str(Path(source).resolve())) for source in sources):
             excludes.append(repo_path)
         for exclude in excludes:
             args.extend(["--exclude", exclude])
         args.append(f"{repo}::{archive_name}")
-        args.extend(self.sources)
-        self.run_borg(args)
+        args.extend(sources)
+        return args
+
+    def run_backup(self, sources: list[str], archive_prefix: str) -> None:
+        repo = self.repo_var.get().strip()
+        if not repo:
+            messagebox.showwarning(APP_NAME, "Выберите хранилище копий.")
+            return
+        if not sources:
+            messagebox.showwarning(APP_NAME, "Добавьте хотя бы один каталог.")
+            return
+
+        Path(repo).mkdir(parents=True, exist_ok=True)
+        commands = []
+        if not self.repo_is_initialized(repo):
+            commands.append(self.borg_init_command(repo))
+        commands.append(self.build_create_args(repo, sources, archive_prefix))
+        self.run_borg_sequence(commands)
+
+    def create_system_backup(self) -> None:
+        confirm = messagebox.askyesno(
+            APP_NAME,
+            "Создать полную копию системы?\n\n"
+            "Будет скопирован корневой каталог / с исключением служебных каталогов "
+            "/proc, /sys, /dev, /run, /tmp, /mnt, /media и самого хранилища копий.",
+        )
+        if confirm:
+            self.run_backup(["/"], "system-")
+
+    def create_backup(self) -> None:
+        self.run_backup(self.sources, "backup-")
 
     def list_archives(self) -> None:
         repo = self.repo_var.get().strip()
         if not repo:
-            messagebox.showwarning(APP_NAME, "Выберите репозиторий Borg.")
+            messagebox.showwarning(APP_NAME, "Выберите хранилище копий.")
             return
         if not shutil.which("borg"):
             messagebox.showerror(APP_NAME, "borgbackup не установлен.")
@@ -362,7 +433,7 @@ class BackupManagerApp(tk.Tk):
     def check_repo(self) -> None:
         repo = self.repo_var.get().strip()
         if not repo:
-            messagebox.showwarning(APP_NAME, "Выберите репозиторий Borg.")
+            messagebox.showwarning(APP_NAME, "Выберите хранилище копий.")
             return
         self.run_borg(["check", "--verify-data", repo])
 
@@ -379,7 +450,9 @@ class BackupManagerApp(tk.Tk):
             "Восстановить архив?\n\n"
             f"Архив: {archive}\n"
             f"Каталог: {target}\n\n"
-            "Файлы будут извлечены в выбранный каталог.",
+            "Файлы будут извлечены в выбранный каталог. Для восстановления всей системы "
+            "лучше запускать программу из LiveUSB или другой установленной системы, "
+            "а целевой системный раздел заранее смонтировать.",
         )
         if not confirm:
             return
