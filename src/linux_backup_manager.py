@@ -114,8 +114,11 @@ class BackupManagerApp(tk.Tk):
         self.archive_var = tk.StringVar()
         self.restore_target_var = tk.StringVar(value="/")
         self.compression_var = tk.StringVar(value="Максимальное сжатие (очень медленно)")
+        self.restore_metadata_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="Готово")
         self.elapsed_var = tk.StringVar(value="")
+        self.current_operation = ""
+        self.current_operation_target = ""
         self.operation_started_at: float | None = None
 
         self._build_ui()
@@ -196,6 +199,11 @@ class BackupManagerApp(tk.Tk):
         ttk.Button(restore_box, text="Восстановить выбранную копию", command=self.restore_archive).grid(
             row=2, column=0, columnspan=3, sticky="ew", pady=(8, 0)
         )
+        ttk.Checkbutton(
+            restore_box,
+            text="Восстанавливать ACL/xattrs/метки безопасности",
+            variable=self.restore_metadata_var,
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         right = ttk.Frame(root)
         right.grid(row=1, column=1, sticky="nsew", pady=(10, 0))
@@ -311,9 +319,44 @@ class BackupManagerApp(tk.Tk):
         if code == 0:
             self.enqueue_log("Готово.")
             self.status_var.set("Готово")
+            if self.current_operation == "check":
+                self.enqueue_log(
+                    "Отчет проверки: целостность подтверждена, Borg завершился с кодом 0."
+                )
+                messagebox.showinfo(
+                    APP_NAME,
+                    "Проверка целостности завершена успешно.\n\n"
+                    f"Проверено: {self.current_operation_target}",
+                )
+            self.current_operation = ""
+            self.current_operation_target = ""
+        elif code == 1:
+            self.enqueue_log("Готово с предупреждениями. Проверьте журнал Borg выше.")
+            self.status_var.set("Готово с предупреждениями")
+            if self.current_operation == "check":
+                self.enqueue_log(
+                    "Отчет проверки: Borg завершил проверку с предупреждениями, код 1."
+                )
+                messagebox.showwarning(
+                    APP_NAME,
+                    "Проверка завершена с предупреждениями.\n\n"
+                    "Посмотрите журнал: Borg сообщил код 1.",
+                )
+            self.current_operation = ""
+            self.current_operation_target = ""
         else:
             self.enqueue_log(f"Команда завершилась с кодом {code}.")
             self.status_var.set("Ошибка выполнения")
+            if self.current_operation == "check":
+                self.enqueue_log(
+                    f"Отчет проверки: обнаружена ошибка проверки, код {code}."
+                )
+                messagebox.showerror(
+                    APP_NAME,
+                    f"Проверка целостности завершилась ошибкой.\n\nКод Borg: {code}",
+                )
+            self.current_operation = ""
+            self.current_operation_target = ""
 
     def rollback_failed_create(self, command: list[str]) -> None:
         if len(command) < 3 or command[0:2] != ["borg", "create"]:
@@ -668,6 +711,8 @@ class BackupManagerApp(tk.Tk):
         if not repo:
             messagebox.showwarning(APP_NAME, "Выберите хранилище копий.")
             return
+        self.current_operation = "check"
+        self.current_operation_target = repo
         self.run_borg(["check", "--verify-data", "--progress", repo])
 
     def restore_archive(self) -> None:
@@ -691,7 +736,11 @@ class BackupManagerApp(tk.Tk):
             return
 
         Path(target).mkdir(parents=True, exist_ok=True)
-        self.run_borg(["extract", "--verbose", "--progress", "--numeric-owner", f"{repo}::{archive}"], cwd=target)
+        args = ["extract", "--verbose", "--progress", "--numeric-owner"]
+        if not self.restore_metadata_var.get():
+            args.extend(["--noacls", "--noxattrs"])
+        args.append(f"{repo}::{archive}")
+        self.run_borg(args, cwd=target)
 
     def stop_command(self) -> None:
         self.runner.stop()
